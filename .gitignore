@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Secrets
+.env
+*.key
+
+# IDE
+.vscode/
+.idea/
+
+# Logs / SLURM
+*.out
+*.err
+slurm-*.out
+
+# Checkpoints / models
+checkpoints/
+outputs/
+wandb/
+
+# Large model/data files
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Mac
+.DS_Store
+
+
+
