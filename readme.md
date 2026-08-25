@@ -17,7 +17,6 @@ prompt on historical AIME and AMC 12 problems with GEPA.
 ## Installation
 
 ```bash
-cd /home/parmida/gepa_math
 python3.12 -m pip install -r requirements.txt
 ```
 
