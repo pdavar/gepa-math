@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from load_data import load_train_validation
@@ -12,7 +13,10 @@ SEED = 42
 DEFAULT_TASK_MAX_TOKENS = 16_384
 DEFAULT_REFLECTOR_MAX_TOKENS = 32_000
 DEFAULT_SEED_PROMPT = "Solve the following math problem in less than {task_max_tokens} tokens"
-TEMPERATURE = 0.9
+TASK_TEMPERATURE = 0.6
+REFLECTOR_TEMPERATURE = 1.0
+OPTIMIZATION_ROLLOUTS = 4
+FINAL_VALIDATION_ROLLOUTS = 8
 TOP_P = 0.95
 DEFAULT_API_BASE = "http://127.0.0.1:8000/v1"
 
@@ -42,6 +46,12 @@ def parse_args() -> argparse.Namespace:
         help="Optimization calls, excluding the initial validation pass (default: 4000)",
     )
     parser.add_argument("--validation-fraction", type=float, default=0.10)
+    parser.add_argument(
+        "--dataset",
+        choices=("mixed", "aime", "amc"),
+        default="mixed",
+        help="Problem domain used for both training and validation (default: mixed)",
+    )
     parser.add_argument("--reflection-minibatch-size", type=int, default=32)
     parser.add_argument(
         "--do-merge",
@@ -97,8 +107,10 @@ def main() -> None:
     import gepa
     from utils import (
         ExactBoxedMathAdapter,
+        BalancedMathBatchSampler,
         ReflectorTraceCallback,
         assert_local_vllm_is_running,
+        exact_boxed_match,
     )
 
     assert_local_vllm_is_running(args.api_base, DEFAULT_API_BASE)
@@ -108,17 +120,28 @@ def main() -> None:
         seed=SEED,
         cache_dir=args.cache_dir,
     )
+    if args.dataset != "mixed":
+        prefix = (
+            "Put the final integer answer"
+            if args.dataset == "aime"
+            else "Put only the letter"
+        )
+        train = [row for row in train if row["input"].startswith(prefix)]
+        validation = [row for row in validation if row["input"].startswith(prefix)]
+        if not train or not validation:
+            raise RuntimeError(f"No {args.dataset.upper()} data remained after splitting")
     if args.budget < 1:
         raise ValueError("--budget must be a positive integer")
 
     print(f"Loaded {len(train)} training and {len(validation)} validation problems.")
-    # GEPA includes its mandatory seed-candidate validation in max_metric_calls.
-    # Add that fixed cost so the user-facing budget applies only to subsequent
-    # optimization work.
-    gepa_metric_call_limit = args.budget + len(validation)
+    # Each problem now costs four metric calls because the optimization score
+    # is the mean correctness across four independently sampled responses.
+    initial_validation_calls = len(validation) * OPTIMIZATION_ROLLOUTS
+    gepa_metric_call_limit = args.budget + initial_validation_calls
     print(
         f"Optimization budget: {args.budget} calls, plus "
-        f"{len(validation)} initial-validation calls.",
+        f"{initial_validation_calls} initial-validation calls; "
+        f"objective=avg@{OPTIMIZATION_ROLLOUTS}.",
         flush=True,
     )
     print(f"First task-model input:\n{train[0]['input']}", flush=True)
@@ -128,11 +151,20 @@ def main() -> None:
         api_base=args.api_base,
         max_workers=args.max_workers,
         max_tokens=args.task_max_tokens,
-        temperature=TEMPERATURE,
+        temperature=TASK_TEMPERATURE,
         top_p=TOP_P,
         seed=SEED,
+        optimization_rollouts=OPTIMIZATION_ROLLOUTS,
     )
     seed_candidate = {"system_prompt": args.seed_prompt}
+    batch_sampler = "epoch_shuffled"
+    reflection_minibatch_size = args.reflection_minibatch_size
+    if args.dataset == "mixed":
+        batch_sampler = BalancedMathBatchSampler(
+            minibatch_size=args.reflection_minibatch_size,
+            seed=SEED,
+        )
+        reflection_minibatch_size = None
 
     result = gepa.optimize(
         seed_candidate=seed_candidate,
@@ -141,13 +173,15 @@ def main() -> None:
         adapter=adapter,
         reflection_lm=args.reflection_model,
         reflection_lm_kwargs={
-            "temperature": TEMPERATURE,
+            "temperature": REFLECTOR_TEMPERATURE,
             "top_p": TOP_P,
             "max_tokens": args.reflector_max_tokens,
             "seed": SEED,
         },
-        reflection_minibatch_size=args.reflection_minibatch_size,
-        batch_sampler="epoch_shuffled",
+        # The custom sampler already owns the minibatch size. GEPA requires
+        # this separate argument to be None when batch_sampler is an object.
+        reflection_minibatch_size=reflection_minibatch_size,
+        batch_sampler=batch_sampler,
         use_merge=args.do_merge,
         max_metric_calls=gepa_metric_call_limit,
         cache_evaluation=True,
@@ -162,6 +196,52 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(result.best_candidate["system_prompt"] + "\n")
     print(f"Wrote the optimized prompt to {args.output}")
+
+    # This is a fresh post-training evaluation and is intentionally outside
+    # the GEPA optimization budget.
+    final_responses = adapter.generate_rollouts(
+        validation,
+        result.best_candidate,
+        FINAL_VALIDATION_ROLLOUTS,
+    )
+    per_problem = [
+        [exact_boxed_match(response, example["answer"]) for response in samples]
+        for example, samples in zip(validation, final_responses, strict=True)
+    ]
+
+    def metrics(indices: list[int]) -> dict[str, float | int]:
+        return {
+            "problems": len(indices),
+            "pass@1": sum(per_problem[index][0] for index in indices) / len(indices),
+            "avg@8": (
+                sum(sum(per_problem[index]) / FINAL_VALIDATION_ROLLOUTS for index in indices)
+                / len(indices)
+            ),
+        }
+
+    aime_indices = [
+        index for index, row in enumerate(validation)
+        if row["input"].startswith("Put the final integer answer")
+    ]
+    amc_indices = [
+        index for index, row in enumerate(validation)
+        if row["input"].startswith("Put only the letter")
+    ]
+    validation_report = {
+        "dataset": args.dataset,
+        "optimization_objective": "avg@4",
+        "task_temperature": TASK_TEMPERATURE,
+        "reflector_temperature": REFLECTOR_TEMPERATURE,
+        "overall": metrics(list(range(len(validation)))),
+    }
+    if aime_indices:
+        validation_report["aime"] = metrics(aime_indices)
+    if amc_indices:
+        validation_report["amc"] = metrics(amc_indices)
+    metrics_path = args.output.with_suffix(".validation_metrics.json")
+    metrics_path.write_text(json.dumps(validation_report, indent=2) + "\n")
+    print("FINAL VALIDATION METRICS:\n" + json.dumps(validation_report, indent=2))
+    print(f"Wrote validation metrics to {metrics_path}")
 
 
 if __name__ == "__main__":

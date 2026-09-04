@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Submit with: sbatch submit.sh [max_budget_calls] [do_merge] [task_max_tokens] [reflection_minibatch_size] [verbose]
-# Example:     sbatch submit.sh 4000 true 16384 32 false
+# Submit with: sbatch submit.sh [max_budget_calls] [do_merge] [task_max_tokens] [reflection_minibatch_size] [verbose] [run_tag] [dataset]
+# Example:     sbatch submit.sh 4000 true 16384 32 false rep1
 #SBATCH --job-name=gepa-math
 #SBATCH --partition=pi_ashia07
 #SBATCH --gres=gpu:1
@@ -18,6 +18,8 @@ DO_MERGE=${2:-true}
 TASK_MAX_TOKENS=${3:-16384}
 REFLECTION_MINIBATCH_SIZE=${4:-32}
 VERBOSE=${5:-false}
+RUN_TAG=${6:-}
+DATASET=${7:-mixed}
 
 TASK_MODEL=${TASK_MODEL:-meta-llama/Meta-Llama-3.1-8B-Instruct}
 REFLECTOR_MODEL=${REFLECTOR_MODEL:-openai/o4-mini}
@@ -29,6 +31,14 @@ if [[ "$DO_MERGE" != "true" && "$DO_MERGE" != "false" ]]; then
 fi
 if [[ "$VERBOSE" != "true" && "$VERBOSE" != "false" ]]; then
     echo "verbose must be either true or false" >&2
+    exit 2
+fi
+if [[ -n "$RUN_TAG" && ! "$RUN_TAG" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo "run_tag may contain only letters, numbers, underscores, and hyphens" >&2
+    exit 2
+fi
+if [[ "$DATASET" != "mixed" && "$DATASET" != "aime" && "$DATASET" != "amc" ]]; then
+    echo "dataset must be mixed, aime, or amc" >&2
     exit 2
 fi
 if [[ -z "${OPENAI_API_KEY:-}" ]]; then
@@ -87,13 +97,15 @@ fi
 # Slashes are unsuitable inside a single output filename.
 TASK_LABEL=${TASK_MODEL//\//_}
 REFLECTOR_LABEL=${REFLECTOR_MODEL//\//_}
-OUTPUT_FILE="$SCRIPT_DIR/outputs/optimized_prompt_${TASK_LABEL}_${REFLECTOR_LABEL}_maxbudget${MAX_BUDGET_CALLS}_merge${DO_MERGE}_minibatch_${REFLECTION_MINIBATCH_SIZE}.txt"
+RUN_SUFFIX=${RUN_TAG:+_run${RUN_TAG}}
+OUTPUT_FILE="$SCRIPT_DIR/outputs/optimized_prompt_${TASK_LABEL}_${REFLECTOR_LABEL}_dataset${DATASET}_maxbudget${MAX_BUDGET_CALLS}_merge${DO_MERGE}_taskmax${TASK_MAX_TOKENS}_tasktemp0p6_refltemp1p0_objavg4_minibatch_${REFLECTION_MINIBATCH_SIZE}${RUN_SUFFIX}.txt"
 
 "$PYTHON" "$SCRIPT_DIR/run_GEPA.py" \
     --task-model "$TASK_MODEL" \
     --reflection-model "$REFLECTOR_MODEL" \
     --api-base "$API_BASE" \
     --budget "$MAX_BUDGET_CALLS" \
+    --dataset "$DATASET" \
     "$MERGE_FLAG" \
     --task-max-tokens "$TASK_MAX_TOKENS" \
     --reflector-max-tokens "$REFLECTOR_MAX_TOKENS" \

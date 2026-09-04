@@ -59,6 +59,17 @@ Useful options:
 --verbose                    Print reflector inputs and raw outputs
 ```
 
+Task-model scoring uses temperature `0.6`, while reflector proposals use
+temperature `1.0`. GEPA optimizes `avg@4`: four task-model responses are
+generated per problem and their mean correctness is used as the score.
+Reflection minibatches default to 32 problems and are balanced evenly between
+AIME and AMC (16 of each).
+
+After optimization, the selected prompt is freshly evaluated with eight
+responses per validation problem. Overall and per-dataset `pass@1` and `avg@8`
+are written to `*.validation_metrics.json`. This final evaluation is outside
+the optimization-call budget.
+
 The default seed prompt is generated from the task-model token limit:
 
 ```text
@@ -73,18 +84,21 @@ validation pass is counted separately and added to GEPA's internal limit.
 Run this command from this directory:
 
 ```bash
-sbatch submit.sh [max_budget_calls] [do_merge] [task_max_tokens] [reflection_minibatch_size] [verbose]
+sbatch submit.sh [max_budget_calls] [do_merge] [task_max_tokens] [reflection_minibatch_size] [verbose] [run_tag]
 ```
 
 For example:
 
 ```bash
-sbatch submit.sh 4000 true 16384 32 false
+sbatch submit.sh 4000 true 16384 32 false rep1
 ```
 
-The defaults are equivalent to that example. `submit.sh` selects a free port,
+The first five arguments have the defaults shown above; the run tag is optional.
+`submit.sh` selects a free port,
 starts vLLM, waits for it to become healthy, and stops it when the job exits.
 Optimized prompts and resumable GEPA state are written under `outputs/`.
+Use a distinct `run_tag` for independent replicas with otherwise identical
+settings so their outputs and checkpoints do not collide.
 
 The task and reflection models can be overridden through environment
 variables:

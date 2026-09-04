@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import re
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -15,6 +16,64 @@ from openai import AsyncOpenAI
 
 
 _BOXED_ANSWER = re.compile(r"\\boxed\s*\{([^{}]*)\}")
+
+
+class BalancedMathBatchSampler:
+    """Select deterministic minibatches containing both AIME and AMC problems."""
+
+    def __init__(self, minibatch_size: int, seed: int = 42) -> None:
+        if minibatch_size < 2:
+            raise ValueError("A balanced minibatch must contain at least 2 problems")
+        self.minibatch_size = minibatch_size
+        self.seed = seed
+        self._current_iteration = None
+        self._calls_in_iteration = 0
+        self._cached_loader_size = None
+        self._aime_ids = []
+        self._amc_ids = []
+
+    def _classify_ids(self, loader) -> None:
+        all_ids = list(loader.all_ids())
+        examples = loader.fetch(all_ids)
+        self._aime_ids = [
+            data_id
+            for data_id, example in zip(all_ids, examples, strict=True)
+            if example["input"].startswith("Put the final integer answer")
+        ]
+        self._amc_ids = [
+            data_id
+            for data_id, example in zip(all_ids, examples, strict=True)
+            if example["input"].startswith("Put only the letter")
+        ]
+        if len(self._aime_ids) + len(self._amc_ids) != len(all_ids):
+            raise ValueError("Every training problem must be identifiable as AIME or AMC")
+        self._cached_loader_size = len(loader)
+
+    def next_minibatch_ids(self, loader, state) -> list:
+        """Return a reproducible batch split as evenly as possible by task type."""
+        if len(loader) != self._cached_loader_size:
+            self._classify_ids(loader)
+
+        if state.i == self._current_iteration:
+            self._calls_in_iteration += 1
+        else:
+            self._current_iteration = state.i
+            self._calls_in_iteration = 0
+
+        # Alternate which task receives the extra example for odd batch sizes.
+        batch_number = state.i + self._calls_in_iteration
+        aime_count = self.minibatch_size // 2
+        if self.minibatch_size % 2 and batch_number % 2 == 0:
+            aime_count += 1
+        amc_count = self.minibatch_size - aime_count
+        if aime_count > len(self._aime_ids) or amc_count > len(self._amc_ids):
+            raise ValueError("Minibatch is larger than an available task group")
+
+        rng = random.Random(self.seed + 1_000_003 * batch_number)
+        selected = rng.sample(self._aime_ids, aime_count)
+        selected += rng.sample(self._amc_ids, amc_count)
+        rng.shuffle(selected)
+        return selected
 
 
 class ReflectorTraceCallback:
@@ -92,6 +151,7 @@ class ExactBoxedMathAdapter(AnyMathsAdapter):
         temperature: float,
         top_p: float,
         seed: int,
+        optimization_rollouts: int = 4,
     ) -> None:
         super().__init__(
             model=model,
@@ -102,8 +162,13 @@ class ExactBoxedMathAdapter(AnyMathsAdapter):
         self.temperature = temperature
         self.top_p = top_p
         self.seed = seed
+        self.optimization_rollouts = optimization_rollouts
 
-    async def _generate(self, requests: list[list[dict[str, str]]]) -> list[str]:
+    async def _generate(
+        self,
+        requests: list[list[dict[str, str]]],
+        rollouts: int,
+    ) -> list[list[str]]:
         semaphore = asyncio.Semaphore(self.max_litellm_workers)
         client_options = {
             "api_key": os.environ.get("OPENAI_API_KEY", "EMPTY"),
@@ -122,22 +187,27 @@ class ExactBoxedMathAdapter(AnyMathsAdapter):
                             result = await client.chat.completions.create(
                                 model=self.model.removeprefix("openai/"),
                                 messages=messages,
+                                n=rollouts,
                                 max_tokens=self.max_tokens,
                                 temperature=self.temperature,
                                 top_p=self.top_p,
                                 seed=self.seed,
                                 tools=[],
                             )
-                            return result.choices[0].message.content or ""
+                            return [
+                                choice.message.content or ""
+                                for choice in result.choices
+                            ]
                         except Exception as error:
                             if attempt == 2:
                                 print(f"Task-model request failed: {error}", flush=True)
-                                return ""
+                                return [""] * rollouts
                             await asyncio.sleep(2**attempt)
 
             return await asyncio.gather(*(complete(request) for request in requests))
 
-    def evaluate(self, batch, candidate, capture_traces: bool = False):
+    def generate_rollouts(self, batch, candidate, rollouts: int) -> list[list[str]]:
+        """Generate a requested number of responses for every problem."""
         system_prompt = candidate["system_prompt"]
         requests = [
             [
@@ -146,22 +216,73 @@ class ExactBoxedMathAdapter(AnyMathsAdapter):
             ]
             for example in batch
         ]
-        responses = asyncio.run(self._generate(requests))
-        scores = [
-            float(exact_boxed_match(response, example["answer"]))
-            for example, response in zip(batch, responses, strict=True)
+        return asyncio.run(self._generate(requests, rollouts))
+
+    def evaluate(self, batch, candidate, capture_traces: bool = False):
+        responses = self.generate_rollouts(
+            batch, candidate, self.optimization_rollouts
+        )
+        rollout_scores = [
+            [exact_boxed_match(response, example["answer"]) for response in samples]
+            for example, samples in zip(batch, responses, strict=True)
+        ]
+        scores = [sum(problem_scores) / self.optimization_rollouts
+                  for problem_scores in rollout_scores]
+        rendered_responses = [
+            "\n\n".join(
+                f"ROLLOUT {index + 1}:\n{response}"
+                for index, response in enumerate(samples)
+            )
+            for samples in responses
         ]
         outputs = [
-            {"full_assistant_response": response} for response in responses
+            {"full_assistant_response": response}
+            for response in rendered_responses
         ]
         trajectories = None
         if capture_traces:
             trajectories = [
-                {"data": example, "full_assistant_response": response}
-                for example, response in zip(batch, responses, strict=True)
+                {
+                    "data": example,
+                    "full_assistant_response": rendered,
+                    "rollout_scores": problem_scores,
+                }
+                for example, rendered, problem_scores in zip(
+                    batch, rendered_responses, rollout_scores, strict=True
+                )
             ]
         return EvaluationBatch(
             outputs=outputs,
             scores=scores,
             trajectories=trajectories,
+            num_metric_calls=len(batch) * self.optimization_rollouts,
         )
+
+    def make_reflective_dataset(
+        self, candidate, eval_batch, components_to_update
+    ):
+        """Tell the reflector how consistently each problem was answered."""
+        if len(components_to_update) != 1:
+            raise ValueError("The math adapter expects one prompt component")
+        component = components_to_update[0]
+        items = []
+        for trajectory in eval_batch.trajectories or []:
+            data = trajectory["data"]
+            rollout_scores = trajectory["rollout_scores"]
+            correct = sum(rollout_scores)
+            total = len(rollout_scores)
+            feedback = (
+                f"{correct} of {total} rollouts were correct. "
+                f"The correct answer is: {data['answer']}. Improve consistency "
+                "while obeying the required boxed-answer format."
+            )
+            items.append(
+                {
+                    "Inputs": data["input"],
+                    "Generated Outputs": trajectory["full_assistant_response"],
+                    "Feedback": feedback,
+                }
+            )
+        if not items:
+            raise ValueError("No evaluation traces were available for reflection")
+        return {component: items}
