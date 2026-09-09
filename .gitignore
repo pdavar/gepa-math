@@ -11,6 +11,7 @@ venv/
 # IDE
 .vscode/
 .idea/
+.ipynb_checkpoints/
 
 # Logs / SLURM
 *.out
@@ -30,6 +31,5 @@ wandb/
 
 # Mac
 .DS_Store
-
 
 

@@ -62,13 +62,26 @@ Useful options:
 Task-model scoring uses temperature `0.6`, while reflector proposals use
 temperature `1.0`. GEPA optimizes `avg@4`: four task-model responses are
 generated per problem and their mean correctness is used as the score.
-Reflection minibatches default to 32 problems and are balanced evenly between
-AIME and AMC (16 of each).
+Reflection minibatches default to 8 problems. Mixed-data batches contain four
+AIME and four AMC examples. Each domain is shuffled and sampled without
+replacement until its queue is exhausted.
+
+By default, optimization stops after every training example has appeared in a
+reflection minibatch. The legacy metric-call budget can instead be enabled
+with `--no-stop-after-coverage`. Coverage, proposal count, accepted-prompt
+count, and acceptance rate are written incrementally to
+`*.training_stats.json`.
 
 After optimization, the selected prompt is freshly evaluated with eight
 responses per validation problem. Overall and per-dataset `pass@1` and `avg@8`
 are written to `*.validation_metrics.json`. This final evaluation is outside
 the optimization-call budget.
+
+`--dataset` controls the training domain only. The held-out validation split
+remains fixed and mixed for every setting, so AMC-only and AIME-only runs also
+report separate AMC and AIME final scores. Prompt selection uses only the
+chosen training domain's portion of that split; the other domain is used only
+in the final post-training evaluation.
 
 The default seed prompt is generated from the task-model token limit:
 

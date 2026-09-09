@@ -7,6 +7,7 @@ import json
 import os
 import random
 import re
+from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
 
@@ -19,18 +20,22 @@ _BOXED_ANSWER = re.compile(r"\\boxed\s*\{([^{}]*)\}")
 
 
 class BalancedMathBatchSampler:
-    """Select deterministic minibatches containing both AIME and AMC problems."""
+    """Sample balanced groups without replacement until all training IDs are seen."""
 
     def __init__(self, minibatch_size: int, seed: int = 42) -> None:
-        if minibatch_size < 2:
-            raise ValueError("A balanced minibatch must contain at least 2 problems")
+        if minibatch_size < 1:
+            raise ValueError("Minibatch size must be positive")
         self.minibatch_size = minibatch_size
         self.seed = seed
-        self._current_iteration = None
-        self._calls_in_iteration = 0
         self._cached_loader_size = None
         self._aime_ids = []
         self._amc_ids = []
+        self._aime_queue = []
+        self._amc_queue = []
+        self._rng = random.Random(seed)
+        self.seen_ids = set()
+        self.minibatches_sampled = 0
+        self.metric_calls_at_full_coverage = None
 
     def _classify_ids(self, loader) -> None:
         all_ids = list(loader.all_ids())
@@ -47,33 +52,141 @@ class BalancedMathBatchSampler:
         ]
         if len(self._aime_ids) + len(self._amc_ids) != len(all_ids):
             raise ValueError("Every training problem must be identifiable as AIME or AMC")
+        if self._aime_ids and self._amc_ids and self.minibatch_size % 2:
+            raise ValueError("A balanced mixed-domain minibatch must have an even size")
         self._cached_loader_size = len(loader)
+        self._aime_queue = []
+        self._amc_queue = []
+        self.seen_ids = set()
+        self.minibatches_sampled = 0
+        self.metric_calls_at_full_coverage = None
+
+    def _draw(self, group_ids: list, queue: list, count: int) -> list:
+        selected = []
+        while len(selected) < count:
+            if not queue:
+                queue.extend(group_ids)
+                self._rng.shuffle(queue)
+            take = min(count - len(selected), len(queue))
+            selected.extend(queue[:take])
+            del queue[:take]
+        return selected
 
     def next_minibatch_ids(self, loader, state) -> list:
         """Return a reproducible batch split as evenly as possible by task type."""
         if len(loader) != self._cached_loader_size:
             self._classify_ids(loader)
 
-        if state.i == self._current_iteration:
-            self._calls_in_iteration += 1
+        if self._aime_ids and self._amc_ids:
+            aime_count = self.minibatch_size // 2
+            amc_count = self.minibatch_size // 2
+        elif self._aime_ids:
+            aime_count = self.minibatch_size
+            amc_count = 0
         else:
-            self._current_iteration = state.i
-            self._calls_in_iteration = 0
+            aime_count = 0
+            amc_count = self.minibatch_size
 
-        # Alternate which task receives the extra example for odd batch sizes.
-        batch_number = state.i + self._calls_in_iteration
-        aime_count = self.minibatch_size // 2
-        if self.minibatch_size % 2 and batch_number % 2 == 0:
-            aime_count += 1
-        amc_count = self.minibatch_size - aime_count
-        if aime_count > len(self._aime_ids) or amc_count > len(self._amc_ids):
-            raise ValueError("Minibatch is larger than an available task group")
-
-        rng = random.Random(self.seed + 1_000_003 * batch_number)
-        selected = rng.sample(self._aime_ids, aime_count)
-        selected += rng.sample(self._amc_ids, amc_count)
-        rng.shuffle(selected)
+        selected = self._draw(self._aime_ids, self._aime_queue, aime_count)
+        selected += self._draw(self._amc_ids, self._amc_queue, amc_count)
+        self._rng.shuffle(selected)
+        self.seen_ids.update(selected)
+        self.minibatches_sampled += 1
         return selected
+
+    @property
+    def total_examples(self) -> int:
+        return len(self._aime_ids) + len(self._amc_ids)
+
+    @property
+    def coverage_complete(self) -> bool:
+        return self.total_examples > 0 and len(self.seen_ids) == self.total_examples
+
+    def coverage_stats(self) -> dict[str, int | float | bool | None]:
+        total = self.total_examples
+        return {
+            "unique_training_examples_seen": len(self.seen_ids),
+            "total_training_examples": total,
+            "coverage_fraction": len(self.seen_ids) / total if total else 0.0,
+            "coverage_complete": self.coverage_complete,
+            "minibatches_sampled": self.minibatches_sampled,
+            "minibatch_size": self.minibatch_size,
+            "aime_examples": len(self._aime_ids),
+            "amc_examples": len(self._amc_ids),
+            "metric_calls_at_full_coverage": self.metric_calls_at_full_coverage,
+        }
+
+
+class TrainingCoverageStopper:
+    """Stop GEPA immediately after the sampler has covered every training ID."""
+
+    def __init__(self, sampler: BalancedMathBatchSampler) -> None:
+        self.sampler = sampler
+
+    def __call__(self, gepa_state) -> bool:
+        complete = self.sampler.coverage_complete
+        if complete and self.sampler.metric_calls_at_full_coverage is None:
+            self.sampler.metric_calls_at_full_coverage = gepa_state.total_num_evals
+        return complete
+
+
+class OptimizationStatsCallback:
+    """Persist coverage and prompt proposal/acceptance counts during a run."""
+
+    def __init__(self, sampler: BalancedMathBatchSampler, output_path: Path) -> None:
+        self.sampler = sampler
+        self.output_path = output_path
+        self.reflective_proposals = 0
+        self.merge_proposals = 0
+        self.accepted_prompts = 0
+        self.last_metric_calls = 0
+
+    def _report(self) -> dict[str, int | float | bool | None]:
+        proposals = self.reflective_proposals + self.merge_proposals
+        report = {
+            **self.sampler.coverage_stats(),
+            "reflective_prompts_proposed": self.reflective_proposals,
+            "merge_prompts_proposed": self.merge_proposals,
+            "prompts_proposed": proposals,
+            "prompts_accepted": self.accepted_prompts,
+            "acceptance_rate": self.accepted_prompts / proposals if proposals else 0.0,
+            "current_metric_calls": self.last_metric_calls,
+        }
+        return report
+
+    def _write(self) -> None:
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.output_path.write_text(json.dumps(self._report(), indent=2) + "\n")
+
+    def on_optimization_start(self, event) -> None:
+        self._write()
+
+    def on_proposal_end(self, event) -> None:
+        self.reflective_proposals += 1
+        self._write()
+
+    def on_merge_attempted(self, event) -> None:
+        self.merge_proposals += 1
+        self._write()
+
+    def on_candidate_accepted(self, event) -> None:
+        self.accepted_prompts += 1
+        self._write()
+
+    def on_iteration_end(self, event) -> None:
+        self.last_metric_calls = event["state"].total_num_evals
+        self._write()
+
+    def on_budget_updated(self, event) -> None:
+        self.last_metric_calls = event["metric_calls_used"]
+        self._write()
+
+    def on_optimization_end(self, event) -> None:
+        self.last_metric_calls = event["total_metric_calls"]
+        self._write()
+
+    def report(self) -> dict[str, int | float | bool | None]:
+        return self._report()
 
 
 class ReflectorTraceCallback:

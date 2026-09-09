@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Submit with: sbatch submit.sh [max_budget_calls] [do_merge] [task_max_tokens] [reflection_minibatch_size] [verbose] [run_tag] [dataset]
-# Example:     sbatch submit.sh 4000 true 16384 32 false rep1
+# Submit with: sbatch submit.sh [max_budget_calls] [do_merge] [task_max_tokens] [reflection_minibatch_size] [verbose] [run_tag] [dataset] [seed_prompt_file]
+# The first argument is used only if run_GEPA.py is switched to
+# --no-stop-after-coverage; coverage stopping is the default.
+# Example:     sbatch submit.sh 4000 true 16384 8 false rep1
 #SBATCH --job-name=gepa-math
 #SBATCH --partition=pi_ashia07
 #SBATCH --gres=gpu:1
@@ -16,10 +18,11 @@ set -euo pipefail
 MAX_BUDGET_CALLS=${1:-4000}
 DO_MERGE=${2:-true}
 TASK_MAX_TOKENS=${3:-16384}
-REFLECTION_MINIBATCH_SIZE=${4:-32}
+REFLECTION_MINIBATCH_SIZE=${4:-8}
 VERBOSE=${5:-false}
 RUN_TAG=${6:-}
 DATASET=${7:-mixed}
+SEED_PROMPT_FILE=${8:-}
 
 TASK_MODEL=${TASK_MODEL:-meta-llama/Meta-Llama-3.1-8B-Instruct}
 REFLECTOR_MODEL=${REFLECTOR_MODEL:-openai/o4-mini}
@@ -93,12 +96,20 @@ VERBOSE_FLAG=()
 if [[ "$VERBOSE" == "true" ]]; then
     VERBOSE_FLAG=(--verbose)
 fi
+SEED_PROMPT_FLAG=()
+if [[ -n "$SEED_PROMPT_FILE" ]]; then
+    if [[ ! -f "$SEED_PROMPT_FILE" ]]; then
+        echo "seed prompt file not found: $SEED_PROMPT_FILE" >&2
+        exit 2
+    fi
+    SEED_PROMPT_FLAG=(--seed-prompt-file "$SEED_PROMPT_FILE")
+fi
 
 # Slashes are unsuitable inside a single output filename.
 TASK_LABEL=${TASK_MODEL//\//_}
 REFLECTOR_LABEL=${REFLECTOR_MODEL//\//_}
 RUN_SUFFIX=${RUN_TAG:+_run${RUN_TAG}}
-OUTPUT_FILE="$SCRIPT_DIR/outputs/optimized_prompt_${TASK_LABEL}_${REFLECTOR_LABEL}_dataset${DATASET}_maxbudget${MAX_BUDGET_CALLS}_merge${DO_MERGE}_taskmax${TASK_MAX_TOKENS}_tasktemp0p6_refltemp1p0_objavg4_minibatch_${REFLECTION_MINIBATCH_SIZE}${RUN_SUFFIX}.txt"
+OUTPUT_FILE="$SCRIPT_DIR/outputs/optimized_prompt_${TASK_LABEL}_${REFLECTOR_LABEL}_dataset${DATASET}_coverage_merge${DO_MERGE}_taskmax${TASK_MAX_TOKENS}_tasktemp0p6_refltemp1p0_objavg4_minibatch_${REFLECTION_MINIBATCH_SIZE}${RUN_SUFFIX}.txt"
 
 "$PYTHON" "$SCRIPT_DIR/run_GEPA.py" \
     --task-model "$TASK_MODEL" \
@@ -111,5 +122,6 @@ OUTPUT_FILE="$SCRIPT_DIR/outputs/optimized_prompt_${TASK_LABEL}_${REFLECTOR_LABE
     --reflector-max-tokens "$REFLECTOR_MAX_TOKENS" \
     --reflection-minibatch-size "$REFLECTION_MINIBATCH_SIZE" \
     "${VERBOSE_FLAG[@]}" \
+    "${SEED_PROMPT_FLAG[@]}" \
     --cache-dir "$HF_HOME" \
     --output "$OUTPUT_FILE"
