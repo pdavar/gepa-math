@@ -305,7 +305,6 @@ class ExactBoxedMathAdapter(AnyMathsAdapter):
                                 temperature=self.temperature,
                                 top_p=self.top_p,
                                 seed=self.seed,
-                                tools=[],
                             )
                             return [
                                 choice.message.content or ""

@@ -1,4 +1,5 @@
 datasets>=3
 gepa>=0.0.17
 litellm>=1.60
+matplotlib>=3.8
 openai>=1.60

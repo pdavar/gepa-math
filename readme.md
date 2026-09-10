@@ -11,7 +11,7 @@ prompt on historical AIME and AMC 12 problems with GEPA.
   optional reflector tracing.
 - `evaluate_test.py`: evaluates an optimized prompt on the latest held-out
   AIME and AMC 12 sets.
-- `submit.sh`: starts vLLM and runs GEPA as a Slurm job.
+- `submit.sh`: starts vLLM and runs GEPA either locally or through Slurm.
 - `requirements.txt`: Python dependencies.
 
 ## Installation
@@ -27,35 +27,39 @@ run:
 export OPENAI_API_KEY="..."
 ```
 
-## Run locally
+## Run the pipeline locally
 
-First start the task model with vLLM:
-
-```bash
-vllm serve meta-llama/Meta-Llama-3.1-8B-Instruct --port 8000
-```
-
-Then run GEPA in another terminal:
+Set the reflector API key, then choose `local` as the first argument:
 
 ```bash
-python3.12 run_GEPA.py \
-  --output outputs/optimized_prompt.txt
+export OPENAI_API_KEY="..."
+./submit.sh local [max_budget_calls] [do_merge] [task_max_tokens] [reflection_minibatch_size] [verbose] [run_tag] [dataset] [seed_prompt_file]
 ```
 
-The task-model endpoint defaults to `http://127.0.0.1:8000/v1`. The script
-checks that a vLLM server is available there before starting.
+For example:
+
+```bash
+./submit.sh local 4000 true 16384 8 false rep1 mixed
+```
+
+The launcher selects a free port, starts vLLM, waits for it to become healthy,
+runs GEPA, and stops vLLM when the pipeline exits. On this instance it detects
+the `../Anaconda/envs/gepa` environment and reuses `../hf_cache`. On other local
+machines it falls back to `python3.12`/`python3` and `vllm` from `PATH`.
 
 Useful options:
 
 ```text
 --task-model                 Task model served by vLLM
 --reflection-model           LiteLLM name of the reflector model
---budget                     Optimization calls after initial validation
+--budget                     Optimization calls with --no-stop-after-coverage
+--stop-after-coverage        Stop after every training example has been sampled
 --do-merge / --no-do-merge   Enable or disable GEPA merge proposals
 --task-max-tokens            Task-model output limit (default: 16384)
 --reflector-max-tokens       Reflector output limit (default: 32000)
---reflection-minibatch-size  Problems used for each reflection (default: 32)
+--reflection-minibatch-size  Problems used for each reflection (default: 8)
 --seed-prompt                Initial prompt optimized by GEPA
+--seed-prompt-file           Read the initial prompt from a UTF-8 file
 --verbose                    Print reflector inputs and raw outputs
 ```
 
@@ -86,27 +90,27 @@ in the final post-training evaluation.
 The default seed prompt is generated from the task-model token limit:
 
 ```text
-Solve the following math problem in less then 16384 tokens
+Solve the following math problem in less than 16384 tokens
 ```
-
-`--budget N` reserves `N` calls for optimization. The mandatory initial
-validation pass is counted separately and added to GEPA's internal limit.
 
 ## Submit with Slurm
 
-Run this command from this directory:
+Choose `slurm` as the first argument. The launcher submits itself with `sbatch`:
 
 ```bash
-sbatch submit.sh [max_budget_calls] [do_merge] [task_max_tokens] [reflection_minibatch_size] [verbose] [run_tag]
+./submit.sh slurm [max_budget_calls] [do_merge] [task_max_tokens] [reflection_minibatch_size] [verbose] [run_tag] [dataset] [seed_prompt_file]
 ```
 
 For example:
 
 ```bash
-sbatch submit.sh 4000 true 16384 32 false rep1
+./submit.sh slurm 4000 true 16384 8 false rep1 mixed
 ```
 
-The first five arguments have the defaults shown above; the run tag is optional.
+Direct submission from the project directory with `sbatch submit.sh slurm ...`
+is also supported. All configuration arguments are optional; the run tag is
+empty and the dataset defaults to `mixed`.
+
 `submit.sh` selects a free port,
 starts vLLM, waits for it to become healthy, and stops it when the job exits.
 Optimized prompts and resumable GEPA state are written under `outputs/`.
@@ -119,8 +123,11 @@ variables:
 ```bash
 TASK_MODEL="meta-llama/Meta-Llama-3.1-8B-Instruct" \
 REFLECTOR_MODEL="openai/o4-mini" \
-sbatch submit.sh 4000 true 16384 32 true
+./submit.sh slurm 4000 true 16384 8 true
 ```
+
+Interpreter, server, and cache locations can also be overridden in either mode
+with `PYTHON_BIN`, `VLLM_BIN`, and `CACHE_DIR`.
 
 ## Evaluate an optimized prompt
 
@@ -129,7 +136,7 @@ sbatch submit.sh 4000 true 16384 32 true
 
 ```bash
 python3.12 evaluate_test.py \
-  outputs/optimized_prompt_TASK_REFLECTOR_maxbudget4000_mergetrue_minibatch_32.txt
+  outputs/optimized_prompt_TASK_REFLECTOR_datasetmixed_coverage_mergetrue_taskmax16384_tasktemp0p6_refltemp1p0_objavg4_minibatch_8.txt
 ```
 
 The full generations, correctness values, and `pass@1`, `avg@8`, and `pass@8`
