@@ -23,6 +23,10 @@ checkpoints/
 outputs/
 wandb/
 
+# Local experiment artifacts
+/plots/
+/prompts/
+
 # Large model/data files
 *.pt
 *.pth
@@ -31,5 +35,4 @@ wandb/
 
 # Mac
 .DS_Store
-
 
