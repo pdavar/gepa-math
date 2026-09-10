@@ -56,7 +56,6 @@ async def generate(args: argparse.Namespace, rows: list[dict], prompt: str) -> l
                     temperature=args.temperature,
                     top_p=args.top_p,
                     seed=args.seed,
-                    tools=[],
                 )
                 return [choice.message.content or "" for choice in response.choices]
 

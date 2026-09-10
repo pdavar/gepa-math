@@ -72,7 +72,6 @@ async def generate_responses(
                     temperature=TEMPERATURE,
                     top_p=TOP_P,
                     seed=SEED,
-                    tools=[],
                 )
                 return [choice.message.content or "" for choice in response.choices]
 

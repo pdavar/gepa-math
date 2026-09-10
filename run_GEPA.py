@@ -93,7 +93,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Initial prompt given to GEPA (default: 'Solve the following math "
-            "problem in less then {task_max_tokens} tokens')"
+            "problem in less than {task_max_tokens} tokens')"
         ),
     )
     seed_group.add_argument(
@@ -213,7 +213,6 @@ def main() -> None:
         reflection_lm=args.reflection_model,
         reflection_lm_kwargs={
             "temperature": REFLECTOR_TEMPERATURE,
-            "top_p": TOP_P,
             "max_tokens": args.reflector_max_tokens,
             "seed": SEED,
         },
